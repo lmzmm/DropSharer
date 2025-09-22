@@ -91,9 +91,9 @@ graph TD
 1.  **克隆仓库**
 
 2.  **安装依赖**
-    > **注意**: `nanoid` 包需要安装 v3 版本以兼容 CommonJS 的 `require` 语法。
+    > **注意**: `nanoid` 包需要安装 v4 版本。
     ```bash
-    npm install express socket.io nanoid@3
+    npm install express socket.io
     ```
 
 3.  **启动服务器**
