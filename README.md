@@ -20,31 +20,45 @@
 本应用采用了一种健壮的混合传输架构，以应对真实世界复杂的网络环境。
 
 ```mermaid
-%% 混合模式文件传输架构图
+%% 混合模式文件传输架构图 (兼容版 v1)
 graph TD
     subgraph "云服务器 (Your Cloud Server)"
-        A[Signaling & Relay Server <br> (Node.js, Express, Socket.IO)]
+        A["Signaling & Relay Server &lt;br&gt; (Node.js, Express, Socket.IO)"]
     end
+
     subgraph "用户 A (广播方)"
         UA[Browser]
     end
+
     subgraph "用户 B (下载方)"
         UB[Browser]
     end
+    
     subgraph "外部服务"
-        S[STUN Server]
+        S["STUN Server &lt;br&gt; (e.g., Google)"]
     end
-    UA -- 1. 连接并创建房间 --> A
-    UB -- 2. 使用短链接加入房间 --> A
-    A -- 3. 协调双方信息 --> UA & UB
-    UA -- 4a. 查询公网IP --> S
-    UB -- 4b. 查询公网IP --> S
-    UA <== P2P 数据流 (Plan A: 高速直连) ==> UB
-    UA -- P2P失败后, 切换到Plan B --> A
-    A -- 通知 B 切换 --> UB
-    UA -- 代理数据流 (Plan B: 备用方案) --> A -- 代理数据流 --> UB
-    linkStyle 5 stroke-width:4px,stroke:green,stroke-dasharray: 5 5;
-    linkStyle 8 stroke-width:4px,stroke:orange,stroke-dasharray: 5 5;
+
+    %% 初始连接
+    UA -- "1. 连接并创建房间" --> A
+    UB -- "2. 使用短链接加入房间" --> A
+    A -- "3. 协调双方信息" --> UA
+    A -- "3. 协调双方信息" --> UB
+
+    %% Plan A: P2P 直连尝试 (WebRTC)
+    UA -- "4a. 通过 STUN 查询公网IP" --> S
+    UB -- "4b. 通过 STUN 查询公网IP" --> S
+    UA <== "P2P 数据流 (Plan A: 高速直连)" ==> UB
+
+    %% Plan B: 服务器代理中转 (Socket.IO)
+    UA -- "P2P失败后, 切换到Plan B" --> A
+    A -- "通知 B 切换" --> UB
+    UA -- "代理数据流 (Plan B: 备用方案)" --> A
+    A -- "代理数据流 (Plan B: 备用方案)" --> UB
+    
+    %% 样式
+    linkStyle 6 stroke-width:4px,stroke:green,stroke-dasharray: 5 5;
+    linkStyle 9 stroke-width:4px,stroke:orange,stroke-dasharray: 5 5;
+    linkStyle 10 stroke-width:4px,stroke:orange,stroke-dasharray: 5 5;
 ```
 
 *   **Plan A (首选)**: 客户端通过 STUN 服务器尝试建立 WebRTC P2P 直连。这是最高效的路径，约 80%-90% 的情况会走此模式。
