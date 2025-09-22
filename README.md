@@ -89,6 +89,10 @@ graph TD
 #### 安装与运行
 
 1.  **克隆仓库**
+     ```bash
+    https://github.com/lmzmm/DropSharer.git
+    cd DropSharer
+    ```
 
 2.  **安装依赖**
     > **注意**: `nanoid` 包需要安装 v4 版本。
