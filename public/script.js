@@ -25,7 +25,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const statusMessage = document.getElementById('status-message');
 
     // --- 全局变量和配置 ---
-    let filesToShare = [];
+    let roomToken = null; //用于存储令牌
+    let filesToShare = []
     let shortId;
     const peerConnections = new Map();
     const CHUNK_SIZE = 256 * 1024;
@@ -95,10 +96,43 @@ document.addEventListener('DOMContentLoaded', () => {
             fileListContainer.classList.add('hidden');
         });
 
-        socket.on('broadcast-started', (newShortId) => {
-            shortId = newShortId;
+        socket.on('broadcast-started', (data) => {
+            shortId = data.shortId;
+            roomToken = data.roomToken; // 保存令牌！
             shareLinkInput.value = `${window.location.origin}/s/${shortId}`;
             broadcastControls.classList.remove('hidden');
+        });
+
+        // 处理断线
+        socket.on('disconnect', () => {
+            if (roomToken) { // 只有广播开始后才显示
+                statusMessage.textContent = '网络连接已断开，正在尝试重连...';
+                statusMessage.style.color = 'orange';
+                statusMessage.classList.remove('hidden'); // 确保状态可见
+            }
+        });
+
+        socket.on('connect', () => {
+            if (roomToken) {
+                console.log('已重新连接到服务器，尝试恢复广播...');
+                socket.emit('reclaim-broadcast', { shortId, roomToken });
+            }
+            // 隐藏可能存在的断线提示
+            if (!watcherView.classList.contains('hidden')) {
+                 statusMessage.classList.add('hidden');
+                 statusMessage.style.color = '';
+            }
+        });
+
+        socket.on('reclaim-successful', () => {
+            console.log('广播会话已成功恢复！');
+            statusMessage.textContent = '网络已恢复！';
+            setTimeout(() => statusMessage.classList.add('hidden'), 2000);
+        });
+
+        socket.on('reclaim-failed', () => {
+            alert('广播会话恢复失败，可能已超时。请重新发起分享。');
+            window.location.reload();
         });
 
         copyButton.addEventListener('click', () => { shareLinkInput.select(); document.execCommand('copy'); });
@@ -378,6 +412,23 @@ document.addEventListener('DOMContentLoaded', () => {
         shortId = path.substring(3);
         socket.emit('watcher-join', shortId);
     }
+
+    // ================== 监听广播方断线重连 ==================
+    socket.on('broadcaster-disconnected', () => {
+            console.warn("广播方连接暂时中断...");
+            statusMessage.textContent = '广播方网络不稳定，正在等待其重连...';
+            statusMessage.style.color = 'orange';
+        });
+
+        socket.on('broadcaster-reconnected', () => {
+            console.log("广播方已重新连接！");
+            statusMessage.textContent = '广播方已重连，即将恢复传输...';
+            statusMessage.style.color = 'green';
+            setTimeout(() => {
+                statusMessage.textContent = '正在连接广播方...'; // 恢复默认状态
+                statusMessage.style.color = '';
+            }, 2000);
+        });
 
     // ================== 通用事件处理 ==================
     socket.on('broadcast-stopped', () => {

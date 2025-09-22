@@ -6,46 +6,96 @@ import { Server } from "socket.io";
 import { nanoid } from 'nanoid';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto'; // 引入加密模块
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-    maxHttpBufferSize: 1e8 // 为代理模式设置 100 MB 的缓冲区
-});
+const io = new Server(server, { maxHttpBufferSize: 1e8 });
 
 const PORT = process.env.PORT || 3000;
+const RECONNECTION_GRACE_PERIOD = 45000; // 45秒宽限期
 
 const broadcasters = {};
 
 app.use(express.static(path.join(__dirname, 'public')));
-
-app.get('/s/:shortId', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+app.get('/s/:shortId', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 io.on('connection', (socket) => {
     console.log(`一个用户连接: ${socket.id}`);
 
-    // --- 广播方创建房间 (无变化) ---
+    // --- 广播方创建房间 (核心修改) ---
     socket.on('broadcaster-start', (filesInfo) => {
         const shortId = nanoid(6);
+        const roomToken = crypto.randomBytes(16).toString('hex'); // 生成安全令牌
         broadcasters[shortId] = {
             broadcasterSocketId: socket.id,
             filesInfo: filesInfo,
-            watchers: {}
+            watchers: {},
+            roomToken: roomToken, // 存储令牌
+            status: 'active', // 'active' or 'disconnected'
+            deletionTimer: null // 用于存储删除计时器
         };
         socket.join(shortId);
-        socket.emit('broadcast-started', shortId);
+        // 将 shortId 和 roomToken 一起返回给广播方
+        socket.emit('broadcast-started', { shortId, roomToken });
         console.log(`广播创建: ${shortId} by ${socket.id}`);
     });
 
-    // --- 下载方加入房间 (无变化) ---
+    // --- 新增：广播方重连并恢复会话 ---
+    socket.on('reclaim-broadcast', ({ shortId, roomToken }) => {
+        const room = broadcasters[shortId];
+        if (room && room.roomToken === roomToken) {
+            console.log(`广播方 ${socket.id} 成功恢复了房间 ${shortId}`);
+            // 清除可能存在的删除计时器
+            if (room.deletionTimer) {
+                clearTimeout(room.deletionTimer);
+                room.deletionTimer = null;
+            }
+            // 更新为新的 socket.id 并激活房间
+            room.broadcasterSocketId = socket.id;
+            room.status = 'active';
+            socket.join(shortId);
+            // 通知房间内的所有接收方，广播方已重连
+            io.to(shortId).emit('broadcaster-reconnected');
+            socket.emit('reclaim-successful');
+        } else {
+            socket.emit('reclaim-failed');
+        }
+    });
+
+    socket.on('disconnect', () => {
+        console.log(`一个用户断开连接: ${socket.id}`);
+        for (const shortId in broadcasters) {
+            const room = broadcasters[shortId];
+            if (room.broadcasterSocketId === socket.id) {
+                console.log(`广播方 ${socket.id} (房间: ${shortId}) 已断开.`);
+                room.status = 'disconnected';
+                // 通知房间内的接收方，广播方暂时掉线
+                io.to(shortId).emit('broadcaster-disconnected');
+
+                // 启动删除计时器
+                room.deletionTimer = setTimeout(() => {
+                    if (room.status === 'disconnected') {
+                        console.log(`宽限期结束，永久关闭房间 ${shortId}`);
+                        io.to(shortId).emit('broadcast-stopped'); // 发送最终停止消息
+                        delete broadcasters[shortId];
+                    }
+                }, RECONNECTION_GRACE_PERIOD);
+                break;
+            }
+        }
+    });
+
+    // --- 下载方加入逻辑 (增加状态检查) ---
     socket.on('watcher-join', (shortId) => {
         const room = broadcasters[shortId];
-        if (!room) { return socket.emit('error-message', '广播不存在或已结束。'); }
+        // 只有活跃的房间才能加入
+        if (!room || room.status !== 'active') {
+            return socket.emit('error-message', '广播不存在或已结束。');
+        }
         socket.join(shortId);
         room.watchers[socket.id] = true;
         io.to(room.broadcasterSocketId).emit('watcher-ready', socket.id);
