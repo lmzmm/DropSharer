@@ -1,4 +1,4 @@
-// public/script.js (最终版：混合模式 + 智能测速 + 断线处理)
+// public/script.js (最终版：混合模式 + 智能测速 + 断线处理 + 会话恢复 + P2P抖动容错)
 
 document.addEventListener('DOMContentLoaded', () => {
     const socket = io();
@@ -26,7 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- 全局变量和配置 ---
     let roomToken = null; //用于存储令牌
-    let filesToShare = []
+    let filesToShare = [];
     let shortId;
     const peerConnections = new Map();
     const CHUNK_SIZE = 256 * 1024;
@@ -36,6 +36,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const rtcConfig = {
         iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
     };
+    // 在全局作用域声明下载方需要的变量，以便 broadcast-stopped 能访问
+    let isSingleFileMode = false, currentFileStreamWriter = null;
 
     // ================== 实用函数 ==================
     const formatBytes = (bytes, decimals = 2) => {
@@ -84,7 +86,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         };
 
-        // --- 开始广播 ---
+        // --- 开始广播 & 会话管理 ---
         startBroadcastButton.addEventListener('click', () => {
             if (filesToShare.length === 0) return alert('请先选择文件！');
             const filesMetadata = filesToShare.map(file => ({
@@ -98,53 +100,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
         socket.on('broadcast-started', (data) => {
             shortId = data.shortId;
-            roomToken = data.roomToken; // 保存令牌！
+            roomToken = data.roomToken;
             shareLinkInput.value = `${window.location.origin}/s/${shortId}`;
             broadcastControls.classList.remove('hidden');
-        });
-
-        // 处理断线
-        socket.on('disconnect', () => {
-            if (roomToken) { // 只有广播开始后才显示
-                statusMessage.textContent = '网络连接已断开，正在尝试重连...';
-                statusMessage.style.color = 'orange';
-                statusMessage.classList.remove('hidden'); // 确保状态可见
-            }
-        });
-
-        socket.on('connect', () => {
-            if (roomToken) {
-                console.log('已重新连接到服务器，尝试恢复广播...');
-                socket.emit('reclaim-broadcast', { shortId, roomToken });
-            }
-            // 隐藏可能存在的断线提示
-            if (!watcherView.classList.contains('hidden')) {
-                 statusMessage.classList.add('hidden');
-                 statusMessage.style.color = '';
-            }
-        });
-
-        socket.on('reclaim-successful', () => {
-            console.log('广播会话已成功恢复！');
-            statusMessage.textContent = '网络已恢复！';
-            setTimeout(() => statusMessage.classList.add('hidden'), 2000);
-        });
-
-        socket.on('reclaim-failed', () => {
-            alert('广播会话恢复失败，可能已超时。请重新发起分享。');
-            window.location.reload();
         });
 
         copyButton.addEventListener('click', () => { shareLinkInput.select(); document.execCommand('copy'); });
         stopBroadcastButton.addEventListener('click', () => { socket.emit('broadcaster-stop', shortId); window.location.reload(); });
 
-        // --- P2P 连接创建与智能测速 ---
+        // --- P2P 连接创建与智能测速 (包含网络抖动容错) ---
         const createPeerConnectionForWatcher = async (watcherSocketId) => {
             const pc = new RTCPeerConnection(rtcConfig);
             peerConnections.set(watcherSocketId, pc);
 
             let initialFallbackTimer = setTimeout(() => handleP2PFailure(watcherSocketId, "初始连接超时"), P2P_TIMEOUT);
-            let disconnectionTimer = null; // 用于处理短暂断线的计时器
+            let disconnectionTimer = null;
 
             pc.oniceconnectionstatechange = () => {
                 const state = pc.iceConnectionState;
@@ -153,7 +123,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 switch (state) {
                     case 'connected':
                     case 'completed':
-                        // 连接成功或从抖动中恢复
                         clearTimeout(initialFallbackTimer);
                         if (disconnectionTimer) {
                             console.log("[P2P] ✅ 连接已从'disconnected'状态自动恢复！");
@@ -163,18 +132,16 @@ document.addEventListener('DOMContentLoaded', () => {
                         break;
 
                     case 'disconnected':
-                        // 连接暂时中断，启动“抖动”缓冲计时器
                         console.warn("[P2P] ⚠️ 连接暂时中断，进入5秒观察期...");
                         if (!disconnectionTimer) {
                             disconnectionTimer = setTimeout(() => {
                                 handleP2PFailure(watcherSocketId, "短暂断线后未能恢复");
-                            }, 5000); // 5秒缓冲期
+                            }, 5000);
                         }
                         break;
 
                     case 'failed':
                     case 'closed':
-                        // 连接彻底失败，立即切换
                         handleP2PFailure(watcherSocketId, `连接状态变为 ${state}`);
                         break;
                 }
@@ -182,16 +149,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const dataChannel = pc.createDataChannel('file-transfer', { ordered: true });
             dataChannel.onopen = async () => {
-                // onopen 内部的测速逻辑完全不变
                 console.log(`[P2P] ✅ DataChannel 打开，准备进行速度测试...`);
                 const speed = await performSpeedTest(dataChannel);
                 console.log(`[P2P] 速度测试结果: ${(speed * 8 / 1024 / 1024).toFixed(2)} Mbps`);
                 if (speed >= SPEED_THRESHOLD) {
-                    console.log(`[P2P] 速度达标，将通过 P2P 模式传输`);
                     dataChannel.send(JSON.stringify({ type: 'p2p-speed-ok' }));
                     sendAllFilesViaP2P(dataChannel);
                 } else {
-                    console.warn(`[P2P] 速度不达标，主动切换到代理模式`);
                     dataChannel.send(JSON.stringify({ type: 'p2p-speed-low' }));
                     setTimeout(() => handleP2PFailure(watcherSocketId, "速度不达标"), 500);
                 }
@@ -202,21 +166,35 @@ document.addEventListener('DOMContentLoaded', () => {
             socket.emit('webrtc-offer', { watcherSocketId: watcherSocketId, sdp: offer });
 
             function handleP2PFailure(id, reason) {
-                if (!peerConnections.has(id)) return; // 防止重复触发
+                if (!peerConnections.has(id)) return;
                 console.warn(`[P2P] ❌ 与 ${id} 的连接失败 (${reason})，切换到代理模式`);
 
-                // 确保所有相关的计时器都被清除
                 clearTimeout(initialFallbackTimer);
-                if (disconnectionTimer) {
-                    clearTimeout(disconnectionTimer);
-                    disconnectionTimer = null;
-                }
+                if (disconnectionTimer) clearTimeout(disconnectionTimer);
 
                 pc.close();
                 peerConnections.delete(id);
                 socket.emit('request-relay-fallback', shortId, id);
                 sendAllFilesViaRelay(id);
             }
+        };
+
+        const performSpeedTest = (dataChannel) => {
+            return new Promise(resolve => {
+                const testData = new ArrayBuffer(TEST_CHUNK_SIZE);
+                const startTime = Date.now();
+                const ackListener = (event) => {
+                    if (JSON.parse(event.data).type === 'speed-test-ack') {
+                        const duration = (Date.now() - startTime) / 1000;
+                        const speed = duration > 0 ? TEST_CHUNK_SIZE / duration : Infinity;
+                        dataChannel.removeEventListener('message', ackListener);
+                        resolve(speed);
+                    }
+                };
+                dataChannel.addEventListener('message', ackListener);
+                dataChannel.send(JSON.stringify({ type: 'speed-test-start' }));
+                dataChannel.send(testData);
+            });
         };
 
         // --- Plan A: P2P 传输逻辑 ---
@@ -293,7 +271,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ================== 下载方逻辑 ==================
     if (path.startsWith('/s/')) {
         let isRelayMode = false, filesMetadata = [], totalFilesSize = 0, totalReceivedSize = 0;
-        let isSingleFileMode = false, currentFileStreamWriter = null, currentFileReceivedSize = 0, currentFileInfo = null;
+        let currentFileReceivedSize = 0, currentFileInfo = null;
         let zip, multiFileReceiveBuffers = {};
 
         // --- 统一消息处理器 ---
@@ -432,24 +410,48 @@ document.addEventListener('DOMContentLoaded', () => {
         socket.emit('watcher-join', shortId);
     }
 
-    // ================== 监听广播方断线重连 ==================
+    // ================== 通用事件处理 (含网络容错UI) ==================
+    // --- 广播方会话恢复 ---
+    socket.on('disconnect', () => {
+        if (roomToken) {
+            statusMessage.textContent = '网络连接已断开，正在尝试重连...';
+            statusMessage.style.color = 'orange';
+            statusMessage.classList.remove('hidden');
+        }
+    });
+    socket.on('connect', () => {
+        if (roomToken) {
+            socket.emit('reclaim-broadcast', { shortId, roomToken });
+        } else if (watcherView.classList.contains('hidden') === false) {
+             statusMessage.textContent = '';
+        }
+    });
+    socket.on('reclaim-successful', () => {
+        statusMessage.textContent = '网络已恢复！';
+        statusMessage.style.color = 'green';
+        setTimeout(() => statusMessage.textContent = '', 2000);
+    });
+    socket.on('reclaim-failed', () => {
+        alert('广播会话恢复失败，可能已超时。');
+        window.location.reload();
+    });
+
+    // --- 下载方监听广播方状态 ---
     socket.on('broadcaster-disconnected', () => {
-            console.warn("广播方连接暂时中断...");
+        if (watcherView.classList.contains('hidden') === false) {
             statusMessage.textContent = '广播方网络不稳定，正在等待其重连...';
             statusMessage.style.color = 'orange';
-        });
-
-        socket.on('broadcaster-reconnected', () => {
-            console.log("广播方已重新连接！");
-            statusMessage.textContent = '广播方已重连，即将恢复传输...';
+        }
+    });
+    socket.on('broadcaster-reconnected', () => {
+        if (watcherView.classList.contains('hidden') === false) {
+            statusMessage.textContent = '广播方已重连！';
             statusMessage.style.color = 'green';
-            setTimeout(() => {
-                statusMessage.textContent = '正在连接广播方...'; // 恢复默认状态
-                statusMessage.style.color = '';
-            }, 2000);
-        });
+            setTimeout(() => statusMessage.textContent = '', 2000);
+        }
+    });
 
-    // ================== 通用事件处理 ==================
+    // --- 最终失败处理 ---
     socket.on('broadcast-stopped', () => {
         statusMessage.textContent = '广播已中断或结束。';
         statusMessage.style.color = 'red';
@@ -458,8 +460,9 @@ document.addEventListener('DOMContentLoaded', () => {
         progressBar.textContent = '已中断';
         peerConnections.forEach(pc => pc.close());
         peerConnections.clear();
-        const writer = window.currentFileStreamWriter; // A bit of a hack to get the writer
-        if (writer) writer.abort().catch(() => {});
+        if (isSingleFileMode && currentFileStreamWriter) {
+            currentFileStreamWriter.abort().catch(() => {});
+        }
     });
 
     socket.on('error-message', (message) => {
