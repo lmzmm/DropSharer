@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/file-sharer.iml" filepath="$PROJECT_DIR$/.idea/file-sharer.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/Dropsharer.iml" filepath="$PROJECT_DIR$/.idea/Dropsharer.iml" />
     </modules>
   </component>
 </project>
