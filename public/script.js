@@ -1,5 +1,4 @@
-// public/script.js (最终版：混合模式 + 智能测速 + 断线处理 + 会话恢复 + P2P抖动容错)
-
+// public/script.js (修正版：混合模式 + 智能测速 + 断线处理 + 会话恢复 + P2P抖动容错 + 测速超时)
 document.addEventListener('DOMContentLoaded', () => {
     const socket = io();
 
@@ -33,6 +32,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const P2P_TIMEOUT = 15000;
     const SPEED_THRESHOLD = 10 * 1024 * 1024 / 8; // 10 Mbps in Bytes/sec (1.25 MB/s)
     const TEST_CHUNK_SIZE = 1 * 1024 * 1024; // 1MB for speed test
+    const SPEED_TEST_TIMEOUT = 10000; // 测速超时, 10秒
     const rtcConfig = {
         iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
     };
@@ -116,6 +116,13 @@ document.addEventListener('DOMContentLoaded', () => {
             let initialFallbackTimer = setTimeout(() => handleP2PFailure(watcherSocketId, "初始连接超时"), P2P_TIMEOUT);
             let disconnectionTimer = null;
 
+            // 关键：发送本端 ICE 候选给 watcher（要与服务器协议一致：使用 targetSocketId）
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.emit('webrtc-ice-candidate', { targetSocketId: watcherSocketId, candidate: event.candidate });
+                }
+            };
+
             pc.oniceconnectionstatechange = () => {
                 const state = pc.iceConnectionState;
                 console.log(`[P2P] ICE state for ${watcherSocketId}: ${state}`);
@@ -147,24 +154,96 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             };
 
+            // 创建 dataChannel 并准备传输（ordered: true）
             const dataChannel = pc.createDataChannel('file-transfer', { ordered: true });
+            dataChannel.binaryType = 'arraybuffer';
+
+            // ==================== [MODIFIED] 健壮的测速函数 ====================
+            const performSpeedTest = (dchan) => {
+                return new Promise((resolve, reject) => {
+                    if (dchan.readyState !== 'open') {
+                        return reject(new Error('Data channel is not open for speed test.'));
+                    }
+
+                    const testData = new ArrayBuffer(TEST_CHUNK_SIZE);
+                    const startTime = Date.now();
+
+                    let ackListener;
+                    let closeListener;
+                    let timeoutId;
+
+                    // 清理函数，用于移除所有监听器和定时器
+                    const cleanup = () => {
+                        if (ackListener) dchan.removeEventListener('message', ackListener);
+                        if (closeListener) dchan.removeEventListener('close', closeListener);
+                        if (timeoutId) clearTimeout(timeoutId);
+                    };
+
+                    // 设置超时定时器
+                    timeoutId = setTimeout(() => {
+                        cleanup();
+                        reject(new Error(`Speed test timed out after ${SPEED_TEST_TIMEOUT / 1000} seconds.`));
+                    }, SPEED_TEST_TIMEOUT);
+
+                    // 监听 ACK 消息
+                    ackListener = (event) => {
+                        if (typeof event.data !== 'string') return;
+                        try {
+                            const parsed = JSON.parse(event.data);
+                            if (parsed.type === 'speed-test-ack') {
+                                const duration = (Date.now() - startTime) / 1000;
+                                const speed = duration > 0 ? TEST_CHUNK_SIZE / duration : Infinity;
+                                cleanup();
+                                resolve(speed);
+                            }
+                        } catch (e) { /* 忽略无法解析的JSON */ }
+                    };
+
+                    // 监听通道关闭事件
+                    closeListener = () => {
+                        cleanup();
+                        reject(new Error('Data channel closed during speed test.'));
+                    };
+
+                    dchan.addEventListener('message', ackListener);
+                    dchan.addEventListener('close', closeListener);
+
+                    try {
+                        dchan.send(JSON.stringify({ type: 'speed-test-start' }));
+                        dchan.send(testData);
+                    } catch (err) {
+                        cleanup();
+                        reject(new Error(`Failed to send speed test data: ${err.message}`));
+                    }
+                });
+            };
+
+            // ==================== [MODIFIED] dataChannel.onopen 使用 try...catch ====================
             dataChannel.onopen = async () => {
                 console.log(`[P2P] ✅ DataChannel 打开，准备进行速度测试...`);
-                const speed = await performSpeedTest(dataChannel);
-                console.log(`[P2P] 速度测试结果: ${(speed * 8 / 1024 / 1024).toFixed(2)} Mbps`);
-                if (speed >= SPEED_THRESHOLD) {
-                    dataChannel.send(JSON.stringify({ type: 'p2p-speed-ok' }));
-                    sendAllFilesViaP2P(dataChannel);
-                } else {
-                    dataChannel.send(JSON.stringify({ type: 'p2p-speed-low' }));
-                    setTimeout(() => handleP2PFailure(watcherSocketId, "速度不达标"), 500);
+                try {
+                    const speed = await performSpeedTest(dataChannel);
+                    console.log(`[P2P] 速度测试结果: ${(speed * 8 / 1024 / 1024).toFixed(2)} Mbps`);
+
+                    if (speed >= SPEED_THRESHOLD) {
+                        dataChannel.send(JSON.stringify({ type: 'p2p-speed-ok' }));
+                        sendAllFilesViaP2P(dataChannel, watcherSocketId);
+                    } else {
+                        dataChannel.send(JSON.stringify({ type: 'p2p-speed-low' }));
+                        setTimeout(() => handleP2PFailure(watcherSocketId, "速度不达标"), 500);
+                    }
+                } catch (err) {
+                    console.warn(`[P2P] 测速失败，将切换到代理模式: ${err.message}`);
+                    handleP2PFailure(watcherSocketId, "测速失败或超时");
                 }
             };
 
+            // 生成并发送 offer
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             socket.emit('webrtc-offer', { watcherSocketId: watcherSocketId, sdp: offer });
 
+            // 失败处理（复用）
             function handleP2PFailure(id, reason) {
                 if (!peerConnections.has(id)) return;
                 console.warn(`[P2P] ❌ 与 ${id} 的连接失败 (${reason})，切换到代理模式`);
@@ -172,63 +251,67 @@ document.addEventListener('DOMContentLoaded', () => {
                 clearTimeout(initialFallbackTimer);
                 if (disconnectionTimer) clearTimeout(disconnectionTimer);
 
-                pc.close();
+                try { pc.close(); } catch (e) {}
                 peerConnections.delete(id);
                 socket.emit('request-relay-fallback', shortId, id);
                 sendAllFilesViaRelay(id);
             }
         };
 
-        const performSpeedTest = (dataChannel) => {
-            return new Promise(resolve => {
-                const testData = new ArrayBuffer(TEST_CHUNK_SIZE);
-                const startTime = Date.now();
-                const ackListener = (event) => {
-                    if (JSON.parse(event.data).type === 'speed-test-ack') {
-                        const duration = (Date.now() - startTime) / 1000;
-                        const speed = duration > 0 ? TEST_CHUNK_SIZE / duration : Infinity;
-                        dataChannel.removeEventListener('message', ackListener);
-                        resolve(speed);
-                    }
+        // 可靠的文件分片发送：按顺序读取切片并在 bufferedAmount 控制下发送
+        const sendFileInChunksViaP2P = (dataChannel, file) => {
+            return new Promise(async (resolve, reject) => {
+                let offset = 0;
+
+                const readChunk = (start, end) => {
+                    return new Promise((res, rej) => {
+                        const fr = new FileReader();
+                        fr.onload = (e) => res(e.target.result);
+                        fr.onerror = (e) => rej(e);
+                        fr.readAsArrayBuffer(file.slice(start, end));
+                    });
                 };
-                dataChannel.addEventListener('message', ackListener);
-                dataChannel.send(JSON.stringify({ type: 'speed-test-start' }));
-                dataChannel.send(testData);
+
+                try {
+                    while (offset < file.size) {
+                        if (dataChannel.bufferedAmount > 16 * 1024 * 1024) {
+                            await new Promise(r => {
+                                const onLow = () => {
+                                    dataChannel.removeEventListener('bufferedamountlow', onLow);
+                                    r();
+                                };
+                                dataChannel.addEventListener('bufferedamountlow', onLow);
+                                dataChannel.bufferedAmountLowThreshold = 8 * 1024 * 1024;
+                            });
+                        }
+
+                        const chunk = await readChunk(offset, Math.min(offset + CHUNK_SIZE, file.size));
+                        if (dataChannel.readyState !== 'open') return reject(new Error('Data channel closed.'));
+                        dataChannel.send(chunk);
+                        offset += chunk.byteLength;
+                    }
+                    resolve();
+                } catch (err) {
+                    reject(err);
+                }
             });
         };
 
         // --- Plan A: P2P 传输逻辑 ---
-        const sendAllFilesViaP2P = async (dataChannel) => {
-            for (const file of filesToShare) {
-                const metadata = { type: 'file-start', name: file.name, size: file.size, fileType: file.type, relativePath: file.webkitRelativePath || file.name };
-                dataChannel.send(JSON.stringify(metadata));
-                await sendFileInChunksViaP2P(dataChannel, file);
-                dataChannel.send(JSON.stringify({ type: 'file-end' }));
+        const sendAllFilesViaP2P = async (dataChannel, watcherSocketId) => {
+            try {
+                for (const file of filesToShare) {
+                    const metadata = { type: 'file-start', name: file.name, size: file.size, fileType: file.type, relativePath: file.webkitRelativePath || file.name };
+                    dataChannel.send(JSON.stringify(metadata));
+                    await sendFileInChunksViaP2P(dataChannel, file);
+                    dataChannel.send(JSON.stringify({ type: 'file-end' }));
+                }
+                dataChannel.send(JSON.stringify({ type: 'transfer-complete' }));
+                console.log(`[P2P] ✅ 所有文件已通过 P2P 发送完毕（${watcherSocketId}）`);
+            } catch (err) {
+                console.warn('[P2P] 发送过程中出错，尝试切换到中继：', err);
+                socket.emit('request-relay-fallback', shortId, watcherSocketId);
             }
-            dataChannel.send(JSON.stringify({ type: 'transfer-complete' }));
-        };
-        const sendFileInChunksViaP2P = (dataChannel, file) => {
-            return new Promise((resolve, reject) => {
-                const fileReader = new FileReader();
-                let offset = 0;
-                dataChannel.bufferedAmountLowThreshold = 8 * 1024 * 1024;
-                const readSlice = (o) => {
-                    if (dataChannel.readyState !== 'open') return reject(new Error('Data channel closed.'));
-                    fileReader.readAsArrayBuffer(file.slice(o, o + CHUNK_SIZE));
-                };
-                const send = () => {
-                    while (offset < file.size && dataChannel.bufferedAmount < 16 * 1024 * 1024) {
-                        dataChannel.send(fileReader.result);
-                        offset += fileReader.result.byteLength;
-                        if (offset < file.size) readSlice(offset);
-                        else return resolve();
-                    }
-                };
-                dataChannel.onbufferedamountlow = send;
-                fileReader.onload = send;
-                fileReader.onerror = (err) => reject(err);
-                readSlice(0);
-            });
         };
 
         // --- Plan B: 代理传输逻辑 ---
@@ -264,7 +347,9 @@ document.addEventListener('DOMContentLoaded', () => {
         });
         socket.on('webrtc-ice-candidate', (payload) => {
             const pc = peerConnections.get(payload.senderSocketId);
-            if (pc) pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+            if (pc && payload.candidate) {
+                pc.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(e => console.warn('addIceCandidate error', e));
+            }
         });
     }
 
@@ -293,7 +378,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
-            const message = JSON.parse(data);
+            const message = JSON.parse(typeof data === 'string' ? data : JSON.stringify(data));
             switch (message.type) {
                 case 'file-start':
                     currentFileInfo = message;
@@ -351,15 +436,20 @@ document.addEventListener('DOMContentLoaded', () => {
                         }
                         return;
                     }
-                    const message = JSON.parse(e.data);
-                    if (message.type === 'speed-test-start') testBytesReceived = 0;
-                    else if (message.type === 'p2p-speed-ok') {
-                        console.log("[P2P] 速度测试通过，切换到P2P文件接收模式");
-                        channel.onmessage = (ev) => handleDataMessage(ev.data);
-                    } else if (message.type === 'p2p-speed-low') {
-                        console.log("[P2P] 速度测试不达标，等待服务器切换指令...");
-                    } else {
-                        handleDataMessage(e.data);
+                    // 字符串消息
+                    try {
+                        const message = JSON.parse(e.data);
+                        if (message.type === 'speed-test-start') testBytesReceived = 0;
+                        else if (message.type === 'p2p-speed-ok') {
+                            console.log("[P2P] 速度测试通过，切换到P2P文件接收模式");
+                            channel.onmessage = (ev) => handleDataMessage(ev.data);
+                        } else if (message.type === 'p2p-speed-low') {
+                            console.log("[P2P] 速度测试不达标，等待服务器切换指令...");
+                        } else {
+                            handleDataMessage(e.data);
+                        }
+                    } catch (ex) {
+                        // 忽略解析错误
                     }
                 };
             };
