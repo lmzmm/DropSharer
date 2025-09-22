@@ -143,16 +143,46 @@ document.addEventListener('DOMContentLoaded', () => {
             const pc = new RTCPeerConnection(rtcConfig);
             peerConnections.set(watcherSocketId, pc);
 
-            let fallbackTimer = setTimeout(() => handleP2PFailure(watcherSocketId, "连接超时"), P2P_TIMEOUT);
+            let initialFallbackTimer = setTimeout(() => handleP2PFailure(watcherSocketId, "初始连接超时"), P2P_TIMEOUT);
+            let disconnectionTimer = null; // 用于处理短暂断线的计时器
 
             pc.oniceconnectionstatechange = () => {
                 const state = pc.iceConnectionState;
-                if (state === 'connected' || state === 'completed') clearTimeout(fallbackTimer);
-                else if (state === 'failed' || state === 'disconnected' || state === 'closed') handleP2PFailure(watcherSocketId, `连接状态变为 ${state}`);
+                console.log(`[P2P] ICE state for ${watcherSocketId}: ${state}`);
+
+                switch (state) {
+                    case 'connected':
+                    case 'completed':
+                        // 连接成功或从抖动中恢复
+                        clearTimeout(initialFallbackTimer);
+                        if (disconnectionTimer) {
+                            console.log("[P2P] ✅ 连接已从'disconnected'状态自动恢复！");
+                            clearTimeout(disconnectionTimer);
+                            disconnectionTimer = null;
+                        }
+                        break;
+
+                    case 'disconnected':
+                        // 连接暂时中断，启动“抖动”缓冲计时器
+                        console.warn("[P2P] ⚠️ 连接暂时中断，进入5秒观察期...");
+                        if (!disconnectionTimer) {
+                            disconnectionTimer = setTimeout(() => {
+                                handleP2PFailure(watcherSocketId, "短暂断线后未能恢复");
+                            }, 5000); // 5秒缓冲期
+                        }
+                        break;
+
+                    case 'failed':
+                    case 'closed':
+                        // 连接彻底失败，立即切换
+                        handleP2PFailure(watcherSocketId, `连接状态变为 ${state}`);
+                        break;
+                }
             };
 
             const dataChannel = pc.createDataChannel('file-transfer', { ordered: true });
             dataChannel.onopen = async () => {
+                // onopen 内部的测速逻辑完全不变
                 console.log(`[P2P] ✅ DataChannel 打开，准备进行速度测试...`);
                 const speed = await performSpeedTest(dataChannel);
                 console.log(`[P2P] 速度测试结果: ${(speed * 8 / 1024 / 1024).toFixed(2)} Mbps`);
@@ -172,32 +202,21 @@ document.addEventListener('DOMContentLoaded', () => {
             socket.emit('webrtc-offer', { watcherSocketId: watcherSocketId, sdp: offer });
 
             function handleP2PFailure(id, reason) {
-                if (!peerConnections.has(id)) return;
+                if (!peerConnections.has(id)) return; // 防止重复触发
                 console.warn(`[P2P] ❌ 与 ${id} 的连接失败 (${reason})，切换到代理模式`);
-                clearTimeout(fallbackTimer);
+
+                // 确保所有相关的计时器都被清除
+                clearTimeout(initialFallbackTimer);
+                if (disconnectionTimer) {
+                    clearTimeout(disconnectionTimer);
+                    disconnectionTimer = null;
+                }
+
                 pc.close();
                 peerConnections.delete(id);
                 socket.emit('request-relay-fallback', shortId, id);
                 sendAllFilesViaRelay(id);
             }
-        };
-
-        const performSpeedTest = (dataChannel) => {
-            return new Promise(resolve => {
-                const testData = new ArrayBuffer(TEST_CHUNK_SIZE);
-                const startTime = Date.now();
-                const ackListener = (event) => {
-                    if (JSON.parse(event.data).type === 'speed-test-ack') {
-                        const duration = (Date.now() - startTime) / 1000;
-                        const speed = duration > 0 ? TEST_CHUNK_SIZE / duration : Infinity;
-                        dataChannel.removeEventListener('message', ackListener);
-                        resolve(speed);
-                    }
-                };
-                dataChannel.addEventListener('message', ackListener);
-                dataChannel.send(JSON.stringify({ type: 'speed-test-start' }));
-                dataChannel.send(testData);
-            });
         };
 
         // --- Plan A: P2P 传输逻辑 ---
