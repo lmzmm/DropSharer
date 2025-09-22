@@ -1,0 +1,66 @@
+<!-- public/index.html -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DropShare 文件分享</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- 广播方视图 -->
+        <div id="broadcaster-view">
+            <div id="drop-zone">
+                <div class="drop-zone-text">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+                    <p>拖拽文件或文件夹到这里</p>
+                    <small>或</small>
+                    <div class="button-group">
+                        <button id="select-files-button">选择文件</button>
+                        <button id="select-folder-button">选择文件夹</button>
+                    </div>
+                </div>
+                 <!-- 隐藏的文件输入框 -->
+                <input type="file" id="file-input" multiple hidden>
+                <input type="file" id="folder-input" webkitdirectory hidden>
+            </div>
+
+            <div id="file-list-container" class="hidden">
+                <h3>待分享的文件:</h3>
+                <ul id="file-list"></ul>
+                <button id="start-broadcast-button">开始分享</button>
+            </div>
+
+            <div id="broadcast-controls" class="hidden">
+                <p>分享链接已生成：</p>
+                <div class="share-link-container">
+                    <input type="text" id="share-link" readonly>
+                    <button id="copy-button">复制</button>
+                </div>
+                <button id="stop-broadcast-button">停止分享</button>
+            </div>
+        </div>
+
+        <!-- 下载方视图 -->
+        <div id="watcher-view" class="hidden">
+            <h2>正在接收文件...</h2>
+            <div id="incoming-files-info">
+                <p><strong>文件数量:</strong> <span id="file-count"></span></p>
+                <p><strong>总大小:</strong> <span id="total-size"></span></p>
+                <ul id="incoming-file-list"></ul>
+            </div>
+            <div class="progress-bar-container">
+                <div id="progress-bar" class="progress-bar">0%</div>
+            </div>
+            <p id="status-message">正在连接广播方...</p>
+        </div>
+    </div>
+
+    <!-- 引入 JSZip -->
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.min.js"></script>
+    <script src="/script.js"></script>
+</body>
+</html>
