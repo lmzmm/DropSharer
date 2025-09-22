@@ -83,7 +83,26 @@ io.on('connection', (socket) => {
 
     // --- 清理逻辑 (无变化) ---
     socket.on('broadcaster-stop', (shortId) => { /* ... */ });
-    socket.on('disconnect', () => { /* ... */ });
+    socket.on('disconnect', () => {
+        console.log(`一个用户断开连接: ${socket.id}`);
+
+        // 遍历所有房间，检查断开的socket是否为广播方
+        for (const shortId in broadcasters) {
+            const room = broadcasters[shortId];
+            if (room.broadcasterSocketId === socket.id) {
+                console.log(`广播方 ${socket.id} (房间: ${shortId}) 已断开.`);
+
+                // 向此房间内的所有 watcher 广播停止消息
+                // 我们直接使用 shortId 作为房间名来广播
+                io.to(shortId).emit('broadcast-stopped');
+
+                // 从内存中删除该房间
+                delete broadcasters[shortId];
+                console.log(`广播房间 ${shortId} 已清理.`);
+                break; // 找到后即可退出循环
+            }
+        }
+    });
 });
 
 server.listen(PORT, () => {

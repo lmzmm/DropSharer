@@ -1,4 +1,4 @@
-// public/script.js (混合模式：STUN P2P + Socket.IO 代理备用)
+// public/script.js (最终版：混合模式 + 智能测速 + 断线处理)
 
 document.addEventListener('DOMContentLoaded', () => {
     const socket = io();
@@ -28,10 +28,12 @@ document.addEventListener('DOMContentLoaded', () => {
     let filesToShare = [];
     let shortId;
     const peerConnections = new Map();
-    const CHUNK_SIZE = 256 * 1024; // 256KB
-    const P2P_TIMEOUT = 15000; // P2P连接超时时间 (15秒)
+    const CHUNK_SIZE = 256 * 1024;
+    const P2P_TIMEOUT = 15000;
+    const SPEED_THRESHOLD = 10 * 1024 * 1024 / 8; // 10 Mbps in Bytes/sec (1.25 MB/s)
+    const TEST_CHUNK_SIZE = 1 * 1024 * 1024; // 1MB for speed test
     const rtcConfig = {
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }] // 仅使用STUN
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
     };
 
     // ================== 实用函数 ==================
@@ -69,19 +71,15 @@ document.addEventListener('DOMContentLoaded', () => {
             filesToShare.push(...Array.from(files));
             updateFileListView();
         };
-
         const updateFileListView = () => {
             fileList.innerHTML = '';
             if (filesToShare.length > 0) {
                 filesToShare.forEach(file => {
                     const li = document.createElement('li');
-                    const path = file.webkitRelativePath || file.name;
-                    li.textContent = `${path} (${formatBytes(file.size)})`;
+                    li.textContent = `${file.webkitRelativePath || file.name} (${formatBytes(file.size)})`;
                     fileList.appendChild(li);
                 });
                 fileListContainer.classList.remove('hidden');
-            } else {
-                fileListContainer.classList.add('hidden');
             }
         };
 
@@ -99,37 +97,40 @@ document.addEventListener('DOMContentLoaded', () => {
 
         socket.on('broadcast-started', (newShortId) => {
             shortId = newShortId;
-            const link = `${window.location.origin}/s/${shortId}`;
-            shareLinkInput.value = link;
+            shareLinkInput.value = `${window.location.origin}/s/${shortId}`;
             broadcastControls.classList.remove('hidden');
         });
 
         copyButton.addEventListener('click', () => { shareLinkInput.select(); document.execCommand('copy'); });
         stopBroadcastButton.addEventListener('click', () => { socket.emit('broadcaster-stop', shortId); window.location.reload(); });
 
-        // --- P2P 连接创建与失败检测 ---
+        // --- P2P 连接创建与智能测速 ---
         const createPeerConnectionForWatcher = async (watcherSocketId) => {
             const pc = new RTCPeerConnection(rtcConfig);
             peerConnections.set(watcherSocketId, pc);
 
-            let fallbackTimer = setTimeout(() => {
-                handleP2PFailure(watcherSocketId, "连接超时");
-            }, P2P_TIMEOUT);
+            let fallbackTimer = setTimeout(() => handleP2PFailure(watcherSocketId, "连接超时"), P2P_TIMEOUT);
 
             pc.oniceconnectionstatechange = () => {
                 const state = pc.iceConnectionState;
-                console.log(`[P2P] ICE state for ${watcherSocketId}: ${state}`);
-                if (state === 'connected' || state === 'completed') {
-                    clearTimeout(fallbackTimer);
-                } else if (state === 'failed' || state === 'disconnected' || state === 'closed') {
-                    handleP2PFailure(watcherSocketId, `连接状态变为 ${state}`);
-                }
+                if (state === 'connected' || state === 'completed') clearTimeout(fallbackTimer);
+                else if (state === 'failed' || state === 'disconnected' || state === 'closed') handleP2PFailure(watcherSocketId, `连接状态变为 ${state}`);
             };
 
             const dataChannel = pc.createDataChannel('file-transfer', { ordered: true });
-            dataChannel.onopen = () => {
-                console.log(`[P2P] ✅ 与 ${watcherSocketId} 的 DataChannel 打开，通过 P2P 模式传输`);
-                sendAllFilesViaP2P(dataChannel);
+            dataChannel.onopen = async () => {
+                console.log(`[P2P] ✅ DataChannel 打开，准备进行速度测试...`);
+                const speed = await performSpeedTest(dataChannel);
+                console.log(`[P2P] 速度测试结果: ${(speed * 8 / 1024 / 1024).toFixed(2)} Mbps`);
+                if (speed >= SPEED_THRESHOLD) {
+                    console.log(`[P2P] 速度达标，将通过 P2P 模式传输`);
+                    dataChannel.send(JSON.stringify({ type: 'p2p-speed-ok' }));
+                    sendAllFilesViaP2P(dataChannel);
+                } else {
+                    console.warn(`[P2P] 速度不达标，主动切换到代理模式`);
+                    dataChannel.send(JSON.stringify({ type: 'p2p-speed-low' }));
+                    setTimeout(() => handleP2PFailure(watcherSocketId, "速度不达标"), 500);
+                }
             };
 
             const offer = await pc.createOffer();
@@ -138,15 +139,31 @@ document.addEventListener('DOMContentLoaded', () => {
 
             function handleP2PFailure(id, reason) {
                 if (!peerConnections.has(id)) return;
-                console.warn(`[P2P] ❌ 与 ${id} 的 P2P 连接失败 (${reason})，切换到代理模式`);
-
+                console.warn(`[P2P] ❌ 与 ${id} 的连接失败 (${reason})，切换到代理模式`);
                 clearTimeout(fallbackTimer);
                 pc.close();
                 peerConnections.delete(id);
-
                 socket.emit('request-relay-fallback', shortId, id);
                 sendAllFilesViaRelay(id);
             }
+        };
+
+        const performSpeedTest = (dataChannel) => {
+            return new Promise(resolve => {
+                const testData = new ArrayBuffer(TEST_CHUNK_SIZE);
+                const startTime = Date.now();
+                const ackListener = (event) => {
+                    if (JSON.parse(event.data).type === 'speed-test-ack') {
+                        const duration = (Date.now() - startTime) / 1000;
+                        const speed = duration > 0 ? TEST_CHUNK_SIZE / duration : Infinity;
+                        dataChannel.removeEventListener('message', ackListener);
+                        resolve(speed);
+                    }
+                };
+                dataChannel.addEventListener('message', ackListener);
+                dataChannel.send(JSON.stringify({ type: 'speed-test-start' }));
+                dataChannel.send(testData);
+            });
         };
 
         // --- Plan A: P2P 传输逻辑 ---
@@ -159,7 +176,6 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             dataChannel.send(JSON.stringify({ type: 'transfer-complete' }));
         };
-
         const sendFileInChunksViaP2P = (dataChannel, file) => {
             return new Promise((resolve, reject) => {
                 const fileReader = new FileReader();
@@ -195,7 +211,6 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             socket.emit('relay-control-message', watcherSocketId, { type: 'transfer-complete' });
         };
-
         const sendFileInChunksViaRelay = (watcherSocketId, file) => {
             return new Promise(resolve => {
                 const fileReader = new FileReader();
@@ -224,12 +239,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ================== 下载方逻辑 ==================
     if (path.startsWith('/s/')) {
-        let isRelayMode = false;
-        let filesMetadata = [], totalFilesSize = 0, totalReceivedSize = 0;
+        let isRelayMode = false, filesMetadata = [], totalFilesSize = 0, totalReceivedSize = 0;
         let isSingleFileMode = false, currentFileStreamWriter = null, currentFileReceivedSize = 0, currentFileInfo = null;
         let zip, multiFileReceiveBuffers = {};
 
-        // --- 统一消息处理器 (处理 P2P 和代理的数据) ---
+        // --- 统一消息处理器 ---
         const handleDataMessage = (data) => {
             if (data instanceof ArrayBuffer) {
                 totalReceivedSize += data.byteLength;
@@ -293,10 +307,30 @@ document.addEventListener('DOMContentLoaded', () => {
             const pc = new RTCPeerConnection(rtcConfig);
             peerConnections.set(payload.broadcasterSocketId, pc);
             pc.ondatachannel = (event) => {
-                console.log("[P2P] ✅ DataChannel 已连接，准备接收 P2P 数据");
+                console.log("[P2P] ✅ DataChannel 已连接，准备进行速度测试");
                 const channel = event.channel;
                 channel.binaryType = 'arraybuffer';
-                channel.onmessage = (e) => handleDataMessage(e.data);
+                let testBytesReceived = 0;
+                channel.onmessage = (e) => {
+                    if (e.data instanceof ArrayBuffer) {
+                        testBytesReceived += e.data.byteLength;
+                        if (testBytesReceived >= TEST_CHUNK_SIZE) {
+                            channel.send(JSON.stringify({ type: 'speed-test-ack' }));
+                            testBytesReceived = 0;
+                        }
+                        return;
+                    }
+                    const message = JSON.parse(e.data);
+                    if (message.type === 'speed-test-start') testBytesReceived = 0;
+                    else if (message.type === 'p2p-speed-ok') {
+                        console.log("[P2P] 速度测试通过，切换到P2P文件接收模式");
+                        channel.onmessage = (ev) => handleDataMessage(ev.data);
+                    } else if (message.type === 'p2p-speed-low') {
+                        console.log("[P2P] 速度测试不达标，等待服务器切换指令...");
+                    } else {
+                        handleDataMessage(e.data);
+                    }
+                };
             };
             await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
             pc.onicecandidate = (event) => {
@@ -322,8 +356,8 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         // --- 监听代理数据 ---
-        socket.on('relay-control-message', (message) => handleDataMessage(JSON.stringify(message)));
-        socket.on('relay-file-chunk', (chunk) => handleDataMessage(chunk));
+        socket.on('relay-control-message', (message) => isRelayMode && handleDataMessage(JSON.stringify(message)));
+        socket.on('relay-file-chunk', (chunk) => isRelayMode && handleDataMessage(chunk));
 
         // --- 初始化 ---
         socket.on('files-info', (metadata) => {
@@ -347,12 +381,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ================== 通用事件处理 ==================
     socket.on('broadcast-stopped', () => {
-        statusMessage.textContent = '广播已停止。';
+        statusMessage.textContent = '广播已中断或结束。';
         statusMessage.style.color = 'red';
         progressBar.style.width = '100%';
         progressBar.style.backgroundColor = '#dc3545';
         progressBar.textContent = '已中断';
         peerConnections.forEach(pc => pc.close());
+        peerConnections.clear();
+        const writer = window.currentFileStreamWriter; // A bit of a hack to get the writer
+        if (writer) writer.abort().catch(() => {});
     });
 
     socket.on('error-message', (message) => {
