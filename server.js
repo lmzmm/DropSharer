@@ -113,6 +113,14 @@ io.on('connection', (socket) => {
     socket.on('relay-control-message', (watcherSocketId, message) => {
         // 将控制消息（如 file-start, file-end）转发给指定的下载方
         io.to(watcherSocketId).emit('relay-control-message', message);
+        
+        // 如果是传输完成消息，则断开与该下载方的连接
+        if (message && message.type === 'transfer-finished') {
+            // 延迟一秒后断开连接，确保消息能被接收
+            setTimeout(() => {
+                io.sockets.sockets.get(watcherSocketId)?.disconnect(true);
+            }, 1000);
+        }
     });
 
     // 添加活动处理

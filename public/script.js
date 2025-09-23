@@ -29,6 +29,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const incomingFileList = document.getElementById('incoming-file-list');
     const progressBar = document.getElementById('progress-bar');
     const statusMessage = document.getElementById('status-message');
+    // 压缩进度相关元素
+    const compressionProgressContainer = document.getElementById('compression-progress-container');
+    const compressionProgressBar = document.getElementById('compression-progress-bar');
+    const compressionStatus = document.getElementById('compression-status');
 
     // --- 全局变量和配置 ---
     let roomToken = null;
@@ -37,6 +41,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const CHUNK_SIZE = 256 * 1024; // 256 KB per chunk
     // 在全局作用域声明下载方需要的变量，以便 broadcast-stopped 能访问
     let isSingleFileMode = false, currentFileStreamWriter = null;
+    let compressedFileBlob = null; // 用于存储压缩后的文件blob
 
     // ================== 实用函数 ==================
     const formatBytes = (bytes, decimals = 2) => {
@@ -86,15 +91,66 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         // --- 开始广播 & 会话管理 ---
-        startBroadcastButton.addEventListener('click', () => {
+        startBroadcastButton.addEventListener('click', async () => {
             if (filesToShare.length === 0) return alert('请先选择文件！');
-            const filesMetadata = filesToShare.map(file => ({
-                name: file.name, size: file.size, type: file.type,
-                relativePath: file.webkitRelativePath || file.name,
-            }));
-            socket.emit('broadcaster-start', filesMetadata);
-            dropZone.classList.add('hidden');
-            fileListContainer.classList.add('hidden');
+            
+            // 只有在多个文件时才进行压缩
+            if (filesToShare.length > 1) {
+                // 显示压缩进度条
+                compressionProgressContainer.classList.remove('hidden');
+                compressionStatus.textContent = '正在准备文件...';
+                compressionProgressBar.style.width = '0%';
+                compressionProgressBar.textContent = '0%';
+                
+                try {
+                    const zip = new JSZip();
+                    
+                    // 将所有文件添加到zip中
+                    for (const file of filesToShare) {
+                        const relativePath = file.webkitRelativePath || file.name;
+                        zip.file(relativePath, file);
+                    }
+                    
+                    // 生成压缩文件并显示进度
+                    compressedFileBlob = await zip.generateAsync({type: "blob"}, (update) => {
+                        const percent = update.percent.toFixed(1);
+                        compressionStatus.textContent = `正在压缩文件... ${percent}%`;
+                        compressionProgressBar.style.width = `${percent}%`;
+                        compressionProgressBar.textContent = `${percent}%`;
+                    });
+                    
+                    // 压缩完成后隐藏进度条
+                    compressionProgressContainer.classList.add('hidden');
+                    
+                    // 发送压缩后的文件信息
+                    const filesMetadata = [{
+                        name: "shared_files.zip",
+                        size: compressedFileBlob.size,
+                        type: "application/zip",
+                        relativePath: "shared_files.zip"
+                    }];
+                    
+                    socket.emit('broadcaster-start', filesMetadata);
+                    dropZone.classList.add('hidden');
+                    fileListContainer.classList.add('hidden');
+                } catch (error) {
+                    console.error('文件压缩失败:', error);
+                    compressionStatus.textContent = '文件压缩失败: ' + error.message;
+                    // 3秒后隐藏进度条
+                    setTimeout(() => {
+                        compressionProgressContainer.classList.add('hidden');
+                    }, 3000);
+                }
+            } else {
+                // 单个文件不需要压缩，直接发送原文件
+                const filesMetadata = filesToShare.map(file => ({
+                    name: file.name, size: file.size, type: file.type,
+                    relativePath: file.webkitRelativePath || file.name,
+                }));
+                socket.emit('broadcaster-start', filesMetadata);
+                dropZone.classList.add('hidden');
+                fileListContainer.classList.add('hidden');
+            }
         });
 
         socket.on('broadcast-started', (data) => {
@@ -110,14 +166,35 @@ document.addEventListener('DOMContentLoaded', () => {
         // --- 服务器代理传输逻辑 ---
         const sendAllFilesViaRelay = async (watcherSocketId) => {
             console.log(`[代理] 🚀 开始通过服务器向 ${watcherSocketId} 中转文件...`);
-            for (const file of filesToShare) {
-                const metadata = { type: 'file-start', name: file.name, size: file.size, fileType: file.type, relativePath: file.webkitRelativePath || file.name };
+            
+            // 根据文件数量决定传输方式
+            if (filesToShare.length > 1) {
+                // 多个文件已被压缩，发送压缩后的文件
+                const metadata = { 
+                    type: 'file-start', 
+                    name: "shared_files.zip", 
+                    size: compressedFileBlob.size, 
+                    fileType: "application/zip", 
+                    relativePath: "shared_files.zip" 
+                };
                 socket.emit('relay-control-message', watcherSocketId, metadata);
-                await sendFileInChunksViaRelay(watcherSocketId, file);
+                await sendFileInChunksViaRelay(watcherSocketId, compressedFileBlob);
                 socket.emit('relay-control-message', watcherSocketId, { type: 'file-end' });
+                socket.emit('relay-control-message', watcherSocketId, { type: 'transfer-complete' });
+            } else {
+                // 单个文件直接发送
+                for (const file of filesToShare) {
+                    const metadata = { type: 'file-start', name: file.name, size: file.size, fileType: file.type, relativePath: file.webkitRelativePath || file.name };
+                    socket.emit('relay-control-message', watcherSocketId, metadata);
+                    await sendFileInChunksViaRelay(watcherSocketId, file);
+                    socket.emit('relay-control-message', watcherSocketId, { type: 'file-end' });
+                }
+                socket.emit('relay-control-message', watcherSocketId, { type: 'transfer-complete' });
             }
-            socket.emit('relay-control-message', watcherSocketId, { type: 'transfer-complete' });
+            
             console.log(`[代理] ✅ 所有文件已通过服务器发送完毕 (${watcherSocketId})`);
+            // 传输完成后断开与该下载方的连接
+            socket.emit('relay-control-message', watcherSocketId, { type: 'transfer-finished' });
         };
 
         const sendFileInChunksViaRelay = (watcherSocketId, file) => {
@@ -172,6 +249,7 @@ document.addEventListener('DOMContentLoaded', () => {
         let filesMetadata = [], totalFilesSize = 0, totalReceivedSize = 0;
         let currentFileReceivedSize = 0, currentFileInfo = null;
         let zip, multiFileReceiveBuffers = {};
+        let transferFinished = false; // 标记传输是否完成
 
         // --- 统一消息处理器 ---
         const handleDataMessage = (data) => {
@@ -233,6 +311,15 @@ document.addEventListener('DOMContentLoaded', () => {
                     } else {
                         statusMessage.textContent = '文件下载完成！';
                     }
+                    break;
+                case 'transfer-finished':
+                    // 传输完成，关闭连接
+                    transferFinished = true;
+                    statusMessage.textContent = '文件传输已完成，连接即将关闭';
+                    setTimeout(() => {
+                        socket.disconnect();
+                        statusMessage.textContent = '文件传输已完成，连接已关闭';
+                    }, 1000);
                     break;
             }
         };
