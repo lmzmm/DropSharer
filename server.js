@@ -13,7 +13,14 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { maxHttpBufferSize: 1e8 }); // 允许较大的buffer，用于文件块
+const io = new Server(server, { 
+    maxHttpBufferSize: 1e8,
+    pingInterval: 45000,   // 45秒发送一次ping包（增加间隔）
+    pingTimeout: 60000,    // 60秒内没有收到pong则断开连接（增加超时时间）
+    upgradeTimeout: 30000, // 30秒升级超时
+    transports: ["websocket", "polling"], // 允许的传输方式
+    allowEIO3: true // 允许兼容旧版本
+});
 
 const PORT = process.env.PORT || 3000;
 const RECONNECTION_GRACE_PERIOD = 45000; // 45秒宽限期
@@ -108,12 +115,27 @@ io.on('connection', (socket) => {
         io.to(watcherSocketId).emit('relay-control-message', message);
     });
 
+    // 添加活动处理
+    socket.on('activity', () => {
+        // 客户端发送活动信号，可以在这里添加活动记录
+        // 用于防止连接超时
+    });
+
     // --- 停止和断开连接的清理逻辑 (已合并和修复) ---
     socket.on('broadcaster-stop', (shortId) => {
         const room = broadcasters[shortId];
         if (room && room.broadcasterSocketId === socket.id) {
             log(`广播方主动停止房间 ${shortId}`);
             io.to(shortId).emit('broadcast-stopped');
+            
+            // 关闭房间内所有连接
+            const socketsInRoom = io.sockets.adapter.rooms.get(shortId);
+            if (socketsInRoom) {
+                for (const socketId of socketsInRoom) {
+                    io.sockets.sockets.get(socketId)?.disconnect(true);
+                }
+            }
+            
             delete broadcasters[shortId];
         }
     });

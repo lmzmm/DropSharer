@@ -1,6 +1,13 @@
 // public/script.js (纯服务器代理模式)
 document.addEventListener('DOMContentLoaded', () => {
-    const socket = io();
+    const socket = io({
+        reconnection: true,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000,
+        reconnectionAttempts: Infinity,
+        transports: ['websocket', 'polling'],
+        timeout: 86400000 // 将超时时间改为一天（24小时 = 86400000毫秒）
+    });
 
     // --- DOM 元素获取 ---
     const broadcasterView = document.getElementById('broadcaster-view');
@@ -117,6 +124,11 @@ document.addEventListener('DOMContentLoaded', () => {
             return new Promise(resolve => {
                 const fileReader = new FileReader();
                 let offset = 0;
+                let chunkCount = 0;
+                const HEARTBEAT_INTERVAL = 50; // 每50个块发送一次心跳（更频繁）
+                
+                // 添加一个变量来跟踪上一次发送心跳的时间
+                let lastHeartbeat = Date.now();
 
                 const readSlice = o => {
                     const slice = file.slice(o, o + CHUNK_SIZE);
@@ -126,11 +138,20 @@ document.addEventListener('DOMContentLoaded', () => {
                 fileReader.onload = e => {
                     socket.emit('relay-file-chunk', watcherSocketId, e.target.result);
                     offset += e.target.result.byteLength;
+                    chunkCount++;
 
-                    if (offset < file.size) {
+                    // 每隔一定数量的块或者每隔一定时间发送一次心跳，避免阻塞Socket.IO心跳
+                    const now = Date.now();
+                    if (chunkCount % HEARTBEAT_INTERVAL === 0 || (now - lastHeartbeat) > 300) {
+                        lastHeartbeat = now;
+                        // 强制发送活动信号，防止连接断开
+                        socket.emit('activity');
+                        // 延迟执行下一次读取，释放事件循环（增加延迟时间）
+                        setTimeout(() => readSlice(offset), 50);
+                    } else if (offset < file.size) {
                         // 关键修改：使用 setTimeout 将下一次读取操作推迟到下一个事件循环
                         // 这给了浏览器处理其他事件（如网络心跳）的机会
-                        setTimeout(() => readSlice(offset), 0);
+                        setTimeout(() => readSlice(offset), 15);
                     } else {
                         resolve();
                     }
@@ -242,20 +263,29 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ================== 通用事件处理 (含网络容错UI) ==================
     // --- 广播方会话恢复 ---
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason) => {
+        console.log('Socket disconnected, reason:', reason);
         if (roomToken) {
             statusMessage.textContent = '网络连接已断开，正在尝试重连...';
             statusMessage.style.color = 'orange';
             statusMessage.classList.remove('hidden');
         }
     });
+    
+    socket.on('pong', () => {
+        // 心跳响应，可以在这里添加心跳日志
+        console.log('Received pong from server');
+    });
+    
     socket.on('connect', () => {
+        console.log('Socket connected, socket id:', socket.id);
         if (roomToken) {
             socket.emit('reclaim-broadcast', { shortId, roomToken });
         } else if (watcherView.classList.contains('hidden') === false) {
              statusMessage.textContent = '';
         }
     });
+    
     socket.on('reclaim-successful', () => {
         statusMessage.textContent = '网络已恢复！';
         statusMessage.style.color = 'green';
