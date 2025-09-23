@@ -117,20 +117,25 @@ document.addEventListener('DOMContentLoaded', () => {
             return new Promise(resolve => {
                 const fileReader = new FileReader();
                 let offset = 0;
-                fileReader.onload = e => {
-                    // 将文件块发送到服务器，由服务器转发
-                    socket.emit('relay-file-chunk', watcherSocketId, e.target.result);
-                    offset += e.target.result.byteLength;
-                    if (offset < file.size) {
-                        readSlice(offset);
-                    } else {
-                        resolve();
-                    }
-                };
+
                 const readSlice = o => {
                     const slice = file.slice(o, o + CHUNK_SIZE);
                     fileReader.readAsArrayBuffer(slice);
                 };
+
+                fileReader.onload = e => {
+                    socket.emit('relay-file-chunk', watcherSocketId, e.target.result);
+                    offset += e.target.result.byteLength;
+
+                    if (offset < file.size) {
+                        // 关键修改：使用 setTimeout 将下一次读取操作推迟到下一个事件循环
+                        // 这给了浏览器处理其他事件（如网络心跳）的机会
+                        setTimeout(() => readSlice(offset), 0);
+                    } else {
+                        resolve();
+                    }
+                };
+
                 readSlice(0);
             });
         };
