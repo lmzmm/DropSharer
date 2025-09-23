@@ -21,10 +21,23 @@ const RECONNECTION_GRACE_PERIOD = 45000; // 45秒宽限期
 const broadcasters = {};
 
 // --- 日志工具 ---
-function log(...args) {
-    const now = new Date().toISOString();
-    console.log(`[${now}]`, ...args);
+// --- 日志工具 ---
+function formatDate(date = new Date()) {
+    const pad = (n) => n.toString().padStart(2, '0');
+    return (
+        date.getFullYear() + ':' +
+        pad(date.getMonth() + 1) + ':' +
+        pad(date.getDate()) + ' ' +
+        pad(date.getHours()) + ':' +
+        pad(date.getMinutes()) + ':' +
+        pad(date.getSeconds())
+    );
 }
+
+function log(...args) {
+    console.log(`[${formatDate()}]`, ...args);
+}
+
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/s/:shortId', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
